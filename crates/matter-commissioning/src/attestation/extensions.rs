@@ -11,6 +11,9 @@
 //! Values are encoded as 4-character UPPERCASE hex strings of the u16
 //! identifier (Matter §6.5.6.1). e.g. VID `0xFFF1` appears as the
 //! UTF-8 string `"FFF1"`.
+//!
+//! Matter §6.2.2.2 also permits `Mvid:`/`Mpid:` substrings in the
+//! commonName when neither Matter-specific OID occurs in the DN.
 
 /// A Matter vendor identifier. 16-bit, allocated by the CSA.
 ///
@@ -100,27 +103,62 @@ pub(crate) const MATTER_PID_OID: Oid<'static> =
 /// Extract the Matter [`VendorId`] from an X.509 subject DN, if present.
 ///
 /// Returns:
-/// - `Ok(Some(vid))` — VID DN attribute present and parsed.
-/// - `Ok(None)` — VID DN attribute absent.
-/// - `Err(_)` — VID DN attribute present but its value is malformed
+/// - `Ok(Some(vid))` — VID attribute or permitted commonName fallback parsed.
+/// - `Ok(None)` — VID absent from the applicable encoding.
+/// - `Err(_)` — VID present but its value is malformed
 ///   (not 4 hex chars, not UTF-8, or hex doesn't fit a u16, or not
 ///   UPPERCASE per Matter §6.5.6.1).
 pub(crate) fn extract_vid(name: &X509Name<'_>) -> Result<Option<VendorId>, MatterDnError> {
-    extract_matter_u16(name, &MATTER_VID_OID).map(|opt| opt.map(VendorId::new))
+    extract_matter_u16(name, &MATTER_VID_OID, "Mvid:").map(|opt| opt.map(VendorId::new))
 }
 
 /// Extract the Matter [`ProductId`] from an X.509 subject DN, if present.
 ///
 /// Same semantics as [`extract_vid`].
 pub(crate) fn extract_pid(name: &X509Name<'_>) -> Result<Option<ProductId>, MatterDnError> {
-    extract_matter_u16(name, &MATTER_PID_OID).map(|opt| opt.map(ProductId::new))
+    extract_matter_u16(name, &MATTER_PID_OID, "Mpid:").map(|opt| opt.map(ProductId::new))
 }
 
-fn extract_matter_u16(name: &X509Name<'_>, oid: &Oid<'_>) -> Result<Option<u16>, MatterDnError> {
-    let Some(attr) = name.iter_attributes().find(|a| a.attr_type() == oid) else {
+fn extract_matter_u16(
+    name: &X509Name<'_>,
+    oid: &Oid<'_>,
+    prefix: &str,
+) -> Result<Option<u16>, MatterDnError> {
+    // Presence of EITHER dedicated OID disables fallback for the entire DN;
+    // never combine a dedicated VID with a commonName PID (or vice versa).
+    if !name
+        .iter_attributes()
+        .any(|a| a.attr_type() == &MATTER_VID_OID || a.attr_type() == &MATTER_PID_OID)
+    {
+        let mut malformed_prefix = false;
+        for attr in name.iter_common_name() {
+            let raw = attr.as_str().map_err(|_| MatterDnError::NonUtf8Value)?;
+            match extract_common_name_u16(raw, prefix) {
+                Ok(Some(value)) => return Ok(Some(value)),
+                Ok(None) => {}
+                Err(MatterDnError::MalformedFallback) => malformed_prefix = true,
+                Err(err) => return Err(err),
+            }
+        }
+        return if malformed_prefix {
+            Err(MatterDnError::MalformedFallback)
+        } else {
+            Ok(None)
+        };
+    }
+
+    let mut attrs = name.iter_attributes().filter(|a| a.attr_type() == oid);
+    let Some(attr) = attrs.next() else {
         return Ok(None);
     };
+    if attrs.next().is_some() {
+        return Err(MatterDnError::DuplicateAttribute);
+    }
     let raw = attr.as_str().map_err(|_| MatterDnError::NonUtf8Value)?;
+    parse_matter_u16(raw).map(Some)
+}
+
+fn parse_matter_u16(raw: &str) -> Result<u16, MatterDnError> {
     if raw.len() != 4 {
         return Err(MatterDnError::WrongLength { actual: raw.len() });
     }
@@ -131,13 +169,39 @@ fn extract_matter_u16(name: &X509Name<'_>, oid: &Oid<'_>) -> Result<Option<u16>,
     if raw != canonical {
         return Err(MatterDnError::NotUppercase);
     }
-    Ok(Some(value))
+    Ok(value)
+}
+
+fn extract_common_name_u16(raw: &str, prefix: &str) -> Result<Option<u16>, MatterDnError> {
+    let mut found_prefix = false;
+    // Matter §6.2.2.2: use the leftmost correctly encoded match, skipping
+    // malformed earlier occurrences. No separator is required after 4 digits.
+    // `get` also safely rejects a four-byte slice ending inside UTF-8.
+    for (offset, _) in raw.match_indices(prefix) {
+        found_prefix = true;
+        if let Some(hex) = raw.get(offset + prefix.len()..offset + prefix.len() + 4) {
+            if let Ok(value) = parse_matter_u16(hex) {
+                return Ok(Some(value));
+            }
+        }
+    }
+    if found_prefix {
+        Err(MatterDnError::MalformedFallback)
+    } else {
+        Ok(None)
+    }
 }
 
 /// Internal error type for Matter DN extraction failures. Wrapped into
 /// [`crate::attestation::error::AttestationError::Parse`] by callers.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum MatterDnError {
+    /// More than one dedicated attribute of the same type is ambiguous.
+    #[error("duplicate Matter VID/PID DN attribute")]
+    DuplicateAttribute,
+    /// A fallback prefix occurs, but no correctly encoded value follows it.
+    #[error("Matter commonName VID/PID prefix has no valid uppercase 4-digit hex value")]
+    MalformedFallback,
     /// The Matter VID/PID attribute value is not valid UTF-8.
     #[error("Matter VID/PID DN attribute is not valid UTF-8")]
     NonUtf8Value,
@@ -158,6 +222,113 @@ pub(crate) enum MatterDnError {
 #[cfg(test)]
 mod tests {
     use super::{ProductId, VendorId};
+
+    use der::Encode as _;
+    use std::str::FromStr as _;
+    use x509_cert::name::Name;
+
+    // Synthetic DN fixtures from the encoding rules in Matter §6.2.2.2.
+    // Parsing a Name directly avoids generating unrelated keys/certificates.
+    #[test]
+    #[allow(clippy::expect_used)] // Test fixtures are valid DER Names.
+    fn common_name_fallback_obeys_matter_encoding_and_precedence() {
+        for (dn, expected) in [
+            ("CN=Test Mvid:FFF1 Mpid:8000", (Some(0xFFF1), Some(0x8000))),
+            ("CN=Mpid:00B1Mvid:002A", (Some(0x002A), Some(0x00B1))),
+            // The next character can also be hex; separators are irrelevant.
+            (
+                "CN=Mvid:FFF1ACME Mpid:00B19899",
+                (Some(0xFFF1), Some(0x00B1)),
+            ),
+            // Skip malformed occurrences, then use the first valid occurrence.
+            (
+                "CN=Mpid:Mvid:FFF1 Mpid:12cd Mpid:FE67 Mpid:8000",
+                (Some(0xFFF1), Some(0xFE67)),
+            ),
+            ("CN=PAI Mvid:FFF1", (Some(0xFFF1), None)),
+            ("CN=Unscoped PAA", (None, None)),
+            ("OU=Mvid:FFF1 Mpid:8000", (None, None)),
+            // RFC 4514 lists RDNs in reverse encoded order. Scan every CN,
+            // preserving the first valid encoded occurrence for each ID.
+            (
+                "CN=Mvid:FFF1 Mpid:8000,CN=Device",
+                (Some(0xFFF1), Some(0x8000)),
+            ),
+            ("CN=Mpid:8000,CN=Mvid:FFF1", (Some(0xFFF1), Some(0x8000))),
+            (
+                "CN=Mvid:FFF2 Mpid:8001,CN=Mvid:FFF1 Mpid:8000",
+                (Some(0xFFF1), Some(0x8000)),
+            ),
+            (
+                "CN=Mvid:FFF1 Mpid:8000,CN=Mvid:bad",
+                (Some(0xFFF1), Some(0x8000)),
+            ),
+            (
+                "CN=Mvid:bad,CN=Mvid:FFF1 Mpid:8000",
+                (Some(0xFFF1), Some(0x8000)),
+            ),
+            // A single dedicated OID disables fallback for BOTH identifiers.
+            (
+                "1.3.6.1.4.1.37244.2.1=FFF2,CN=Mvid:FFF1 Mpid:8000",
+                (Some(0xFFF2), None),
+            ),
+            (
+                "1.3.6.1.4.1.37244.2.2=8001,CN=Mvid:FFF1 Mpid:8000",
+                (None, Some(0x8001)),
+            ),
+            (
+                "1.3.6.1.4.1.37244.2.1=FFF2,CN=Mvid:invalid Mpid:invalid",
+                (Some(0xFFF2), None),
+            ),
+        ] {
+            let der = Name::from_str(dn)
+                .expect("fixture Name")
+                .to_der()
+                .expect("Name DER");
+            let (_, name) = x509_parser::x509::X509Name::from_der(&der).expect("parse Name");
+            assert_eq!(
+                super::extract_vid(&name).expect(dn).map(VendorId::as_u16),
+                expected.0,
+                "{dn}"
+            );
+            assert_eq!(
+                super::extract_pid(&name).expect(dn).map(ProductId::as_u16),
+                expected.1,
+                "{dn}"
+            );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)] // Test fixtures are valid DER Names, with invalid IDs.
+    fn malformed_ids_do_not_become_absent_or_fall_back() {
+        for dn in [
+            "CN=Mvid:",
+            "CN=Mvid:FFF",
+            "CN=Mvid:fff1",
+            "CN=Mvid:GGGG",
+            "CN=Mvid:\\+123",
+            "CN=Mvid:ééé",
+            "CN=Device,CN=Mvid:bad",
+            "1.3.6.1.4.1.37244.2.1=fff1,CN=Mvid:FFF1",
+            "1.3.6.1.4.1.37244.2.1=FFF1,1.3.6.1.4.1.37244.2.1=FFF2",
+        ] {
+            let der = Name::from_str(dn)
+                .expect("fixture Name")
+                .to_der()
+                .expect("Name DER");
+            let (_, name) = x509_parser::x509::X509Name::from_der(&der).expect("parse Name");
+            assert!(super::extract_vid(&name).is_err(), "{dn}");
+        }
+        for dn in ["CN=Mvid:FFF1 Mpid:", "CN=Mvid:FFF1 Mpid:800g"] {
+            let der = Name::from_str(dn)
+                .expect("fixture Name")
+                .to_der()
+                .expect("Name DER");
+            let (_, name) = x509_parser::x509::X509Name::from_der(&der).expect("parse Name");
+            assert!(super::extract_pid(&name).is_err(), "{dn}");
+        }
+    }
 
     #[test]
     fn vendor_id_round_trips_through_u16() {

@@ -78,13 +78,17 @@ fn placeholder_sig() -> Signature {
     Signature::new([0u8; 64])
 }
 
-fn main_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+fn main_chain(common_name_fallback: bool) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     // --- PAA: self-signed root ---
     let (paa_pkcs8, paa_pk) = gen_key();
-    let paa_dn = DistinguishedName::new(vec![
-        DnAttribute::CommonName("Matter Test PAA (synthetic)".into()),
-        DnAttribute::VendorId(VID),
-    ]);
+    let paa_dn = DistinguishedName::new(if common_name_fallback {
+        vec![DnAttribute::CommonName("Synthetic PAA Mvid:FFF1".into())]
+    } else {
+        vec![
+            DnAttribute::CommonName("Matter Test PAA (synthetic)".into()),
+            DnAttribute::VendorId(VID),
+        ]
+    });
     let paa_der = build_x509_der(
         TestCertFields {
             serial: vec![0x01],
@@ -105,10 +109,14 @@ fn main_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 
     // --- PAI: issued by PAA, VID-scoped ---
     let (pai_pkcs8, pai_pk) = gen_key();
-    let pai_dn = DistinguishedName::new(vec![
-        DnAttribute::CommonName("Matter Test PAI (synthetic)".into()),
-        DnAttribute::VendorId(VID),
-    ]);
+    let pai_dn = DistinguishedName::new(if common_name_fallback {
+        vec![DnAttribute::CommonName("Synthetic PAI Mvid:FFF1".into())]
+    } else {
+        vec![
+            DnAttribute::CommonName("Matter Test PAI (synthetic)".into()),
+            DnAttribute::VendorId(VID),
+        ]
+    });
     let pai_der = build_x509_der(
         TestCertFields {
             serial: vec![0x02],
@@ -129,11 +137,17 @@ fn main_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 
     // --- DAC: leaf, issued by PAI, VID+PID, clientAuth EKU ---
     let (_dac_pkcs8, dac_pk) = gen_key();
-    let dac_dn = DistinguishedName::new(vec![
-        DnAttribute::CommonName("Matter Test DAC (synthetic)".into()),
-        DnAttribute::VendorId(VID),
-        DnAttribute::ProductId(PID),
-    ]);
+    let dac_dn = DistinguishedName::new(if common_name_fallback {
+        vec![DnAttribute::CommonName(
+            "Synthetic DAC Mvid:FFF1 Mpid:8001".into(),
+        )]
+    } else {
+        vec![
+            DnAttribute::CommonName("Matter Test DAC (synthetic)".into()),
+            DnAttribute::VendorId(VID),
+            DnAttribute::ProductId(PID),
+        ]
+    });
     let dac_der = build_x509_der(
         TestCertFields {
             serial: vec![0x03],
@@ -158,7 +172,7 @@ fn main_chain() -> (Vec<u8>, Vec<u8>, Vec<u8>) {
 
 #[test]
 fn built_chain_round_trips_vid_pid_via_x509_parser() {
-    let (paa_der, pai_der, dac_der) = main_chain();
+    let (paa_der, pai_der, dac_der) = main_chain(false);
 
     // Parsing through the production Dac/Pai/Paa wrappers exercises
     // x509-parser's extract_vid/extract_pid, which require exactly 4
@@ -176,7 +190,7 @@ fn built_chain_round_trips_vid_pid_via_x509_parser() {
 
 #[test]
 fn built_chain_passes_real_verify_chain() {
-    let (paa_der, pai_der, dac_der) = main_chain();
+    let (paa_der, pai_der, dac_der) = main_chain(false);
 
     let dac = Dac::from_der(&dac_der).unwrap();
     let pai = Pai::from_der(&pai_der).unwrap();
@@ -194,4 +208,52 @@ fn built_chain_passes_real_verify_chain() {
     assert_eq!(result.product_id, ProductId::new(PID));
     assert_eq!(result.dac_public_key.len(), 65);
     assert_ne!(result.paa_subject, b"");
+}
+
+#[test]
+fn common_name_fallback_chain_passes_real_verifier_and_still_requires_trust_and_signature() {
+    let (paa_der, pai_der, mut dac_der) = main_chain(true);
+    let paa = Paa::from_der(&paa_der).expect("fallback PAA");
+    let pai = Pai::from_der(&pai_der).expect("fallback PAI");
+    let dac = Dac::from_der(&dac_der).expect("fallback DAC");
+    assert_eq!(paa.subject_vid(), Some(VendorId::new(VID)));
+    assert_eq!(pai.subject_vid(), VendorId::new(VID));
+    assert_eq!(pai.subject_pid(), None);
+    assert_eq!(dac.subject_vid(), VendorId::new(VID));
+    assert_eq!(dac.subject_pid(), ProductId::new(PID));
+
+    let at = MatterTime::from_unix_secs(AT_UNIX);
+    assert!(verify_chain(&dac, &pai, &PaaTrustStore::empty(), at).is_err());
+    let mut store = PaaTrustStore::empty();
+    store.add(paa);
+    let result = verify_chain(&dac, &pai, &store, at).expect("trusted fallback chain");
+    assert_eq!(result.vendor_id, VendorId::new(VID));
+    assert_eq!(result.product_id, ProductId::new(PID));
+
+    // Change the signature only: the subject remains parseable but untrusted.
+    *dac_der.last_mut().expect("nonempty certificate") ^= 1;
+    let tampered = Dac::from_der(&dac_der).expect("subject still parses");
+    assert!(verify_chain(&tampered, &pai, &store, at).is_err());
+}
+
+#[test]
+fn common_name_fallback_preserves_required_and_forbidden_fields() {
+    use der::{Decode as _, Encode as _};
+    use std::str::FromStr as _;
+    use x509_cert::{name::Name, Certificate};
+
+    // These altered certificates exercise structural parsing only; changing
+    // a subject intentionally invalidates its signature.
+    fn with_subject(der: &[u8], subject: &str) -> Vec<u8> {
+        let mut cert = Certificate::from_der(der).expect("fixture certificate");
+        cert.tbs_certificate.subject = Name::from_str(subject).expect("fixture subject");
+        cert.to_der().expect("fixture DER")
+    }
+
+    let (paa_der, pai_der, dac_der) = main_chain(true);
+    assert!(Dac::from_der(&with_subject(&dac_der, "CN=Mvid:FFF1")).is_err());
+    assert!(Dac::from_der(&with_subject(&dac_der, "CN=Mpid:8001")).is_err());
+    assert!(Pai::from_der(&with_subject(&pai_der, "CN=Mpid:8001")).is_err());
+    assert!(Pai::from_der(&with_subject(&pai_der, "CN=Mvid:FFF1 Mpid:bad")).is_err());
+    assert!(Paa::from_der(&with_subject(&paa_der, "CN=Mvid:FFF1 Mpid:8001")).is_err());
 }
