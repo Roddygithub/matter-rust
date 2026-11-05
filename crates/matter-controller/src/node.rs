@@ -412,7 +412,7 @@ impl Node {
                 opcode,
                 protocol_id,
                 payload,
-                reply,
+                reply: reply.into(),
             })
             .await
             .map_err(|_| Error::ControllerStopped)?;
@@ -463,7 +463,7 @@ impl Node {
                 timeout_ms,
                 action_opcode,
                 action_payload,
-                reply,
+                reply: reply.into(),
             })
             .await
             .map_err(|_| Error::ControllerStopped)?;
@@ -603,7 +603,7 @@ impl Node {
                 timed_payload,
                 keys,
                 timeout_ms: TIMED_DEFAULT_MS,
-                reply,
+                reply: reply.into(),
             })
             .await
             .map_err(|_| Error::ControllerStopped)?;
@@ -691,6 +691,47 @@ impl Node {
     /// or the response fields cannot be decoded.
     pub async fn invoke(&self, path: CommandPath, fields: Value) -> Result<InvokeResult, Error> {
         self.invoke_tlv(path, value_to_tlv(&fields)?).await
+    }
+
+    /// Invoke before an absolute deadline, including queued work, timed fallback
+    /// and reliable retransmissions. Dropping this future abandons further sends.
+    /// Already transmitted packets cannot be recalled.
+    ///
+    /// # Errors
+    /// As [`Self::invoke`]; deadline expiry returns [`Error::Operational`].
+    pub async fn invoke_before(
+        &self,
+        path: CommandPath,
+        fields: Value,
+        deadline: std::time::Instant,
+    ) -> Result<InvokeResult, Error> {
+        let fields_tlv = value_to_tlv(&fields)?;
+        let (reply, rx) = oneshot::channel();
+        let operation = async {
+            self.tx
+                .send(Command::Action {
+                    node_id: self.node_id,
+                    opcode: OP_INVOKE_REQUEST,
+                    plain_payload: build_invoke_request(path, &fields_tlv),
+                    timed_payload: Box::new(move || build_invoke_request_timed(path, &fields_tlv)),
+                    keys: vec![(path.cluster, path.command)],
+                    timeout_ms: TIMED_DEFAULT_MS,
+                    reply: crate::actor::ActionReply::before(reply, deadline),
+                })
+                .await
+                .map_err(|_| Error::ControllerStopped)?;
+            rx.await.map_err(|_| Error::ControllerStopped)?
+        };
+        let resp = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation)
+            .await
+            .map_err(|_| Error::Operational("action deadline elapsed".into()))??;
+        match parse_invoke_response(&resp)? {
+            InvokeResponse::Status(s) => Ok(InvokeResult::Status(s)),
+            InvokeResponse::Command { path, fields_tlv } => Ok(InvokeResult::Data {
+                path,
+                fields: tlv_to_value(&fields_tlv)?,
+            }),
+        }
     }
 
     /// Invoke a command with **pre-encoded** TLV command fields — e.g. the

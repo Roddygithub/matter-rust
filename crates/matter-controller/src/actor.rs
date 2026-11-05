@@ -877,10 +877,81 @@ struct PendingRequest {
     payload: Vec<u8>,
 }
 
+/// Reply ownership follows an action through queues, reconnects and timed fallback.
+pub(crate) struct ActionReply {
+    tx: oneshot::Sender<Result<Vec<u8>, Error>>,
+    deadline: Option<std::time::Instant>,
+}
+impl From<oneshot::Sender<Result<Vec<u8>, Error>>> for ActionReply {
+    fn from(tx: oneshot::Sender<Result<Vec<u8>, Error>>) -> Self {
+        Self { tx, deadline: None }
+    }
+}
+impl ActionReply {
+    pub(crate) fn before(
+        tx: oneshot::Sender<Result<Vec<u8>, Error>>,
+        deadline: std::time::Instant,
+    ) -> Self {
+        Self {
+            tx,
+            deadline: Some(deadline),
+        }
+    }
+    fn stopped(&self) -> bool {
+        self.tx.is_closed()
+            || self
+                .deadline
+                .is_some_and(|d| std::time::Instant::now() >= d)
+    }
+    async fn until_stopped<T>(
+        &mut self,
+        send: impl std::future::Future<Output = Result<T, Error>>,
+    ) -> Result<T, Error> {
+        if self.stopped() {
+            return Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            ));
+        }
+        let deadline = self.deadline;
+        tokio::select! {
+            biased;
+            () = self.tx.closed() => Err(Error::Operational("action caller dropped".into())),
+            () = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+                    None => std::future::pending().await,
+                }
+            } => Err(Error::Operational("action deadline elapsed".into())),
+            result = send => result,
+        }
+    }
+    fn send(self, value: Result<Vec<u8>, Error>) -> Result<(), Result<Vec<u8>, Error>> {
+        self.tx.send(value)
+    }
+}
+impl PendingReply {
+    fn action_reply_mut(&mut self) -> Option<&mut ActionReply> {
+        match self {
+            Self::Action { reply, .. }
+            | Self::TimedAction { reply, .. }
+            | Self::RoundTrip(reply) => Some(reply),
+            _ => None,
+        }
+    }
+    fn action_stopped(&self) -> bool {
+        match self {
+            Self::Action { reply, .. }
+            | Self::TimedAction { reply, .. }
+            | Self::RoundTrip(reply) => reply.stopped(),
+            _ => false,
+        }
+    }
+}
+
 /// Where a resolved pending op delivers its result.
 enum PendingReply {
     /// Single request/response (`Node::round_trip`).
-    RoundTrip(oneshot::Sender<Result<Vec<u8>, Error>>),
+    RoundTrip(ActionReply),
     /// Timed handshake: a `TimedRequest` is in flight. On `StatusResponse(SUCCESS)`
     /// the actor sends `action_payload` (opcode `action_opcode`) on the SAME
     /// exchange and converts this pending into a [`RoundTrip`](Self::RoundTrip)
@@ -888,7 +959,7 @@ enum PendingReply {
     TimedAction {
         action_opcode: u8,
         action_payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     },
     /// A plain write/invoke awaiting its response. On a `NEEDS_TIMED_INTERACTION`
     /// rejection the actor records `keys` in the learned timed-cache and retries
@@ -902,7 +973,7 @@ enum PendingReply {
         keys: Vec<(u32, u32)>,
         timeout_ms: u16,
         node_id: u64,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     },
     /// Chunked write: ONE `WriteRequest` chunk is in flight at a time on this
     /// exchange (chip's `WriteClient`: exactly one outstanding reliable
@@ -1107,7 +1178,7 @@ pub(crate) enum Command {
         opcode: u8,
         protocol_id: matter_transport::ProtocolId,
         payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     },
     /// Chunked secured read to `node_id` — returns every `ReportData` chunk
     /// already parsed, in order (the `Node` reassembles them via
@@ -1179,7 +1250,7 @@ pub(crate) enum Command {
         timed_payload: TimedPayload,
         keys: Vec<(u32, u32)>,
         timeout_ms: u16,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     },
     /// Timed round-trip: send a `TimedRequest`, await `StatusResponse(SUCCESS)`,
     /// then send `action_opcode`/`action_payload` on the SAME exchange and return
@@ -1190,7 +1261,7 @@ pub(crate) enum Command {
         timeout_ms: u16,
         action_opcode: u8,
         action_payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     },
     /// Send a chunked write as N `WriteRequestMessage`s on ONE exchange, ONE
     /// chunk in flight at a time — chip's `WriteClient` allows exactly one
@@ -2712,6 +2783,13 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
     /// Commands that need no per-device session — and any verb whose session is
     /// already cached — run inline via [`Self::dispatch_ready`].
     async fn dispatch(&mut self, cmd: Command) {
+        if matches!(&cmd, Command::Action { reply, .. } if reply.stopped()) {
+            fail_command(
+                cmd,
+                Error::Operational("action deadline elapsed or caller dropped".into()),
+            );
+            return;
+        }
         if let Some(node_id) = command_target_node(&cmd) {
             if let Ok(fabric_id) = self.sole_fabric().map(|f| f.fabric_id) {
                 if !self.cache.contains_key(&(fabric_id, node_id)) {
@@ -3068,8 +3146,14 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         // Durability-critical: the caller must not consider the fabric created
         // (and its private keys safe) until the snapshot is on disk. Serialize
         // under `&self`, then drop the borrow before awaiting the offloaded save.
-        let job = self.durable_save_inputs()?;
-        save_offloaded(job).await?;
+        let result = match self.durable_save_inputs() {
+            Ok(job) => save_offloaded(job).await,
+            Err(error) => Err(error),
+        };
+        if let Err(error) = result {
+            self.state.fabrics.pop();
+            return Err(error);
+        }
         Ok(fabric_id)
     }
 
@@ -5257,6 +5341,13 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
     /// are already in the caller's channel. The new bytes are stored back as
     /// the request.
     async fn resume_resend_pending(&mut self, mut p: Pending, sid: SessionId, peer: SocketAddr) {
+        if p.reply.action_stopped() {
+            Self::fail_pending(
+                p,
+                Error::Operational("action deadline elapsed or caller dropped".into()),
+            );
+            return;
+        }
         if let PendingReply::Subscribe {
             sub_id,
             report_tx,
@@ -5283,12 +5374,13 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             );
         }
         let sent = self
-            .send_request(
+            .send_request_guarded(
                 sid,
                 peer,
                 p.request.opcode,
                 p.request.protocol_id,
                 &p.request.payload,
+                p.reply.action_reply_mut(),
             )
             .await;
         match sent {
@@ -5805,6 +5897,20 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         protocol_id: ProtocolId,
         payload: &[u8],
     ) -> Result<(u16, MessageCounter), Error> {
+        self.send_request_guarded(sid, peer, opcode, protocol_id, payload, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)] // optional action lifetime at the send boundary
+    async fn send_request_guarded(
+        &mut self,
+        sid: SessionId,
+        peer: SocketAddr,
+        opcode: u8,
+        protocol_id: ProtocolId,
+        payload: &[u8],
+        reply: Option<&mut ActionReply>,
+    ) -> Result<(u16, MessageCounter), Error> {
         let out = self.sessions.encode_outbound(
             sid,
             None,
@@ -5815,10 +5921,20 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             Instant::now(),
         )?;
         let exchange = out.exchange_id;
-        self.transport
-            .send_to(&out.wire_bytes, peer)
-            .await
-            .map_err(|e| Error::Operational(format!("request send: {e}")))?;
+        let send = async {
+            self.transport
+                .send_to(&out.wire_bytes, peer)
+                .await
+                .map_err(|e| Error::Operational(format!("request send: {e}")))
+        };
+        let result = match reply {
+            Some(reply) => reply.until_stopped(send).await,
+            None => send.await,
+        };
+        if let Err(error) = result {
+            self.abort_exchange(sid, exchange, peer).await;
+            return Err(error);
+        }
         Ok((exchange, out.message_counter))
     }
 
@@ -5832,8 +5948,15 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         opcode: u8,
         protocol_id: ProtocolId,
         payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     ) {
+        if reply.stopped() {
+            let _ = reply.send(Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            )));
+            return;
+        }
+
         let (sid, peer) = match self.session_for(node_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -5883,16 +6006,24 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         timeout_ms: u16,
         action_opcode: u8,
         action_payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        mut reply: ActionReply,
     ) {
+        if reply.stopped() {
+            let _ = reply.send(Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            )));
+            return;
+        }
+
         let req = matter_interaction::build_timed_request(timeout_ms);
         match self
-            .send_request(
+            .send_request_guarded(
                 sid,
                 peer,
                 OP_TIMED_REQUEST,
                 ProtocolId::INTERACTION_MODEL,
                 &req,
+                Some(&mut reply),
             )
             .await
         {
@@ -5932,8 +6063,15 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         timeout_ms: u16,
         action_opcode: u8,
         action_payload: Vec<u8>,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        reply: ActionReply,
     ) {
+        if reply.stopped() {
+            let _ = reply.send(Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            )));
+            return;
+        }
+
         let (sid, peer) = match self.session_for(node_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -5965,8 +6103,15 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         timed_payload: TimedPayload,
         keys: Vec<(u32, u32)>,
         timeout_ms: u16,
-        reply: oneshot::Sender<Result<Vec<u8>, Error>>,
+        mut reply: ActionReply,
     ) {
+        if reply.stopped() {
+            let _ = reply.send(Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            )));
+            return;
+        }
+
         let (sid, peer) = match self.session_for(node_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -5974,6 +6119,12 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
                 return;
             }
         };
+        if reply.stopped() {
+            let _ = reply.send(Err(Error::Operational(
+                "action deadline elapsed or caller dropped".into(),
+            )));
+            return;
+        }
         // Fast-path: a known-timed path skips the wasted plain attempt. This is
         // one of the two places the timed payload is actually encoded.
         if keys.iter().any(|k| self.timed_paths.contains(k)) {
@@ -5990,12 +6141,13 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             return;
         }
         match self
-            .send_request(
+            .send_request_guarded(
                 sid,
                 peer,
                 opcode,
                 ProtocolId::INTERACTION_MODEL,
                 &plain_payload,
+                Some(&mut reply),
             )
             .await
         {
@@ -6038,6 +6190,14 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         let Some(p) = self.pending.remove(&(sid, exchange)) else {
             return;
         };
+        if p.reply.action_stopped() {
+            self.abort_exchange(sid, exchange, p.peer).await;
+            Self::fail_pending(
+                p,
+                Error::Operational("action deadline elapsed or caller dropped".into()),
+            );
+            return;
+        }
         let PendingReply::Action {
             opcode,
             timed_payload,
@@ -6493,10 +6653,18 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         let Some(p) = self.pending.remove(&(sid, exchange)) else {
             return;
         };
+        if p.reply.action_stopped() {
+            self.abort_exchange(sid, exchange, p.peer).await;
+            Self::fail_pending(
+                p,
+                Error::Operational("action deadline elapsed or caller dropped".into()),
+            );
+            return;
+        }
         let PendingReply::TimedAction {
             action_opcode,
             action_payload,
-            reply,
+            mut reply,
         } = p.reply
         else {
             return;
@@ -6508,8 +6676,14 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             let _ = reply.send(Ok(payload));
             return;
         }
-        let counter = match self
-            .send_on_exchange(sid, exchange, p.peer, action_opcode, &action_payload)
+        let counter = match reply
+            .until_stopped(self.send_on_exchange(
+                sid,
+                exchange,
+                p.peer,
+                action_opcode,
+                &action_payload,
+            ))
             .await
         {
             Ok(counter) => counter,
@@ -7554,7 +7728,33 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
     /// `Expired` resolve the matching pending op — retrying once on a fresh
     /// session if the cached one was stale (preserves the original
     /// reconnect-once policy).
+    async fn abort_stopped_action(&mut self, sid: SessionId, exchange: u16) -> bool {
+        if !self
+            .pending
+            .get(&(sid, exchange))
+            .is_some_and(|p| p.reply.action_stopped())
+        {
+            return false;
+        }
+        if let Some(p) = self.pending.remove(&(sid, exchange)) {
+            self.abort_exchange(sid, exchange, p.peer).await;
+            Self::fail_pending(
+                p,
+                Error::Operational("action deadline elapsed or caller dropped".into()),
+            );
+        }
+        true
+    }
+
     async fn drive_mrp(&mut self) {
+        let mut stopped: std::collections::HashSet<_> = self
+            .pending
+            .iter()
+            .filter_map(|(key, p)| p.reply.action_stopped().then_some(*key))
+            .collect();
+        for (sid, exchange) in stopped.iter().copied() {
+            self.abort_stopped_action(sid, exchange).await;
+        }
         // Address each standalone ACK now, while its session still exists. A
         // session's `Expired` comes before its ACKs in the batch, and its
         // `on_pending_timeout` can orphan and release the session
@@ -7578,10 +7778,33 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         for (event, ack_peer) in events {
             match event {
                 MrpEvent::Retransmit {
-                    session_id, packet, ..
+                    session_id,
+                    exchange_id,
+                    packet,
+                    ..
                 } => {
+                    if stopped.contains(&(session_id, exchange_id))
+                        || self.abort_stopped_action(session_id, exchange_id).await
+                    {
+                        stopped.insert((session_id, exchange_id));
+                        continue;
+                    }
                     if let Some(peer) = self.peer_for_session(session_id) {
-                        let _ = self.transport.send_to(&packet, peer).await;
+                        let send = async {
+                            self.transport
+                                .send_to(&packet, peer)
+                                .await
+                                .map_err(|e| Error::Operational(format!("request send: {e}")))
+                        };
+                        if let Some(reply) = self
+                            .pending
+                            .get_mut(&(session_id, exchange_id))
+                            .and_then(|p| p.reply.action_reply_mut())
+                        {
+                            let _ = reply.until_stopped(send).await;
+                        } else {
+                            let _ = send.await;
+                        }
                     }
                 }
                 MrpEvent::Expired {
@@ -15115,7 +15338,7 @@ mod tests {
                 },
                 retried: false,
                 last_reliable_send: None,
-                reply: PendingReply::RoundTrip(reply_tx),
+                reply: PendingReply::RoundTrip(reply_tx.into()),
             },
         );
     }
@@ -15145,7 +15368,7 @@ mod tests {
                 },
                 retried: false,
                 last_reliable_send: None,
-                reply: PendingReply::RoundTrip(reply_tx),
+                reply: PendingReply::RoundTrip(reply_tx.into()),
             },
         );
         reply_rx
@@ -22916,6 +23139,166 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn deadline_create_fabric_failure_rolls_back() {
+        let mut actor = test_actor(Arc::new(FailingStore));
+        assert!(actor.handle_create_fabric(&cfg()).await.is_err());
+        assert!(actor.state.fabrics.is_empty());
+        actor.store = Arc::new(MemStore::default());
+        assert!(actor.handle_create_fabric(&cfg()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn deadline_cancels_a_blocked_send_future() {
+        let (tx, rx) = oneshot::channel();
+        let mut reply =
+            ActionReply::before(tx, std::time::Instant::now() + Duration::from_millis(10));
+        let emitted = std::cell::Cell::new(false);
+        let send = async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            emitted.set(true);
+            Ok(())
+        };
+        assert!(reply.until_stopped(send).await.is_err());
+        assert!(!emitted.get());
+        drop(rx);
+        assert!(reply
+            .until_stopped(async {
+                emitted.set(true);
+                Ok(())
+            })
+            .await
+            .is_err());
+        assert!(!emitted.get());
+    }
+
+    const OP_INVOKE_REQUEST: u8 = 0x08;
+    fn deadline_action(reply: ActionReply) -> Command {
+        Command::Action {
+            node_id: 0x42,
+            opcode: OP_INVOKE_REQUEST,
+            plain_payload: vec![],
+            timed_payload: Box::new(Vec::new),
+            keys: vec![],
+            timeout_ms: 1000,
+            reply,
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_expired_or_cancelled_before_dispatch_and_after_connect() {
+        for cancelled in [false, true] {
+            for ready in [false, true] {
+                let mut w = wired_actor();
+                let (tx, rx) = oneshot::channel();
+                let deadline = std::time::Instant::now()
+                    + if cancelled {
+                        Duration::from_secs(5)
+                    } else {
+                        Duration::ZERO
+                    };
+                let cmd = deadline_action(ActionReply::before(tx, deadline));
+                let mut rx = Some(rx);
+                if cancelled {
+                    drop(rx.take());
+                }
+                if ready {
+                    w.actor.dispatch_ready(cmd).await;
+                } else {
+                    w.actor.dispatch(cmd).await;
+                }
+                assert!(w.actor.pending_connects.is_empty());
+                assert!(w.actor.pending.is_empty());
+                assert!(w.next_sent(Duration::from_millis(10)).await.is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_stops_mrp_and_timed_fallback() {
+        for cancelled in [false, true] {
+            for mode in 0..4 {
+                let mut w = wired_actor();
+                let peer = w.dev.local_addr();
+                let (tx, rx) = oneshot::channel();
+                let mut reply =
+                    ActionReply::before(tx, std::time::Instant::now() + Duration::from_secs(5));
+                let (exchange, counter) = w
+                    .actor
+                    .send_request(
+                        w.sid,
+                        peer,
+                        OP_INVOKE_REQUEST,
+                        ProtocolId::INTERACTION_MODEL,
+                        &[],
+                    )
+                    .await
+                    .unwrap(); // wired session is valid
+                assert!(w.next_sent(SENT_WITHIN).await.is_some());
+                if cancelled {
+                    drop(rx);
+                } else {
+                    reply.deadline = Some(std::time::Instant::now());
+                }
+                w.actor.pending.insert(
+                    (w.sid, exchange),
+                    Pending {
+                        response_deadline: Instant::now() + Duration::from_secs(10),
+                        node_id: 0x42,
+                        peer,
+                        request: PendingRequest {
+                            opcode: OP_INVOKE_REQUEST,
+                            protocol_id: ProtocolId::INTERACTION_MODEL,
+                            payload: vec![],
+                        },
+                        retried: false,
+                        last_reliable_send: Some(counter),
+                        reply: if mode == 1 {
+                            PendingReply::TimedAction {
+                                action_opcode: OP_INVOKE_REQUEST,
+                                action_payload: vec![],
+                                reply,
+                            }
+                        } else {
+                            PendingReply::Action {
+                                opcode: OP_INVOKE_REQUEST,
+                                timed_payload: Box::new(Vec::new),
+                                keys: vec![],
+                                timeout_ms: 1000,
+                                node_id: 0x42,
+                                reply,
+                            }
+                        },
+                    },
+                );
+                if mode == 1 {
+                    w.actor
+                        .resolve_timed(
+                            w.sid,
+                            exchange,
+                            matter_interaction::build_status_response(0),
+                        )
+                        .await;
+                } else if mode == 2 {
+                    w.actor
+                        .resolve_action(
+                            w.sid,
+                            exchange,
+                            matter_interaction::build_status_response(0xc6),
+                        )
+                        .await;
+                } else if mode == 3 {
+                    let p = w.actor.pending.remove(&(w.sid, exchange)).unwrap(); // inserted above
+                    w.actor.resume_resend_pending(p, w.sid, peer).await;
+                } else {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    w.actor.drive_mrp().await;
+                }
+                assert!(w.actor.pending.is_empty());
+                assert!(w.next_sent(Duration::from_millis(10)).await.is_none());
+            }
+        }
+    }
     fn wired_actor() -> Wired {
         use matter_crypto::pase::PaseSessionKeys;
         let keys = || PaseSessionKeys {
@@ -23186,7 +23569,7 @@ mod tests {
         let mut w = wired_actor();
         w.route_node(0x42);
         let (reply, mut reply_rx) = oneshot::channel();
-        w.seed(0x30, 0x08, PendingReply::RoundTrip(reply));
+        w.seed(0x30, 0x08, PendingReply::RoundTrip(reply.into()));
         w.deliver_close_session().await;
         // `try_recv`, not `.await`: the caller is answered inside
         // `handle_inbound`, so "at once" is checked literally.
@@ -23237,10 +23620,10 @@ mod tests {
                     keys: vec![],
                     timeout_ms: 1000,
                     node_id: 0x42,
-                    reply: action_reply,
+                    reply: action_reply.into(),
                 },
             ),
-            (0x34, PendingReply::RoundTrip(raw_reply)),
+            (0x34, PendingReply::RoundTrip(raw_reply.into())),
         ];
         for (exchange, reply) in replies {
             w.actor.pending.insert(
@@ -23410,7 +23793,7 @@ mod tests {
                 },
                 retried: false,
                 last_reliable_send: None,
-                reply: PendingReply::RoundTrip(reply),
+                reply: PendingReply::RoundTrip(reply.into()),
             },
         );
         w.deliver_close_session().await;
@@ -23579,7 +23962,11 @@ mod tests {
             .decode_inbound(&ours.wire_bytes, Instant::now())
             .unwrap();
         let (reply, mut reply_rx) = oneshot::channel();
-        w.seed(ours.exchange_id, 0x08, PendingReply::RoundTrip(reply));
+        w.seed(
+            ours.exchange_id,
+            0x08,
+            PendingReply::RoundTrip(reply.into()),
+        );
         let from = w.dev.local_addr();
 
         let theirs = w
@@ -23665,7 +24052,11 @@ mod tests {
             .decode_inbound(&ours.wire_bytes, Instant::now())
             .unwrap();
         let (reply, _reply_rx) = oneshot::channel();
-        w.seed(ours.exchange_id, 0x02, PendingReply::RoundTrip(reply));
+        w.seed(
+            ours.exchange_id,
+            0x02,
+            PendingReply::RoundTrip(reply.into()),
+        );
 
         // No subscription matches, so the actor answers InvalidSubscription.
         let report = build_report_data(1, 0x06, 0x0000, &matter_codec::Value::Bool(true));
@@ -23747,7 +24138,7 @@ mod tests {
                 },
                 retried: false,
                 last_reliable_send: Some(sent.1),
-                reply: PendingReply::RoundTrip(reply),
+                reply: PendingReply::RoundTrip(reply.into()),
             },
         );
         // The device receives R and ACKs it at once.
@@ -23843,7 +24234,7 @@ mod tests {
                 Box::new(|| vec![0x15, 0x18]),
                 vec![],
                 1000,
-                tx,
+                tx.into(),
             )
             .await;
         assert_eq!(w.actor.pending.len(), 1);
@@ -23922,7 +24313,7 @@ mod tests {
         // Round trip.
         let (tx, _rx) = oneshot::channel();
         w.actor
-            .start_round_trip(0x42, 0x08, im, vec![0x15, 0x18], tx)
+            .start_round_trip(0x42, 0x08, im, vec![0x15, 0x18], tx.into())
             .await;
         assert_eq!(sole(&w).1, Some(last_sent(&w)), "start_round_trip");
         w.actor.pending.clear();
@@ -23938,7 +24329,7 @@ mod tests {
                 Box::new(|| vec![0x15, 0x18]),
                 vec![],
                 1000,
-                tx,
+                tx.into(),
             )
             .await;
         assert_eq!(sole(&w).1, Some(last_sent(&w)), "handle_action");
@@ -23967,7 +24358,7 @@ mod tests {
         // Timed: the TimedRequest, then the action after StatusResponse(0).
         let (tx, _rx) = oneshot::channel();
         w.actor
-            .begin_timed(w.sid, peer, 0x42, 1000, 0x08, vec![0x15, 0x18], tx)
+            .begin_timed(w.sid, peer, 0x42, 1000, 0x08, vec![0x15, 0x18], tx.into())
             .await;
         assert_eq!(sole(&w).1, Some(last_sent(&w)), "begin_timed");
         let (exchange, _) = sole(&w);
@@ -24063,7 +24454,7 @@ mod tests {
     async fn a_round_trip_response_is_acked_before_the_caller_is_answered() {
         let mut w = wired_actor();
         let (reply, mut reply_rx) = oneshot::channel();
-        w.seed(0x60, 0x02, PendingReply::RoundTrip(reply));
+        w.seed(0x60, 0x02, PendingReply::RoundTrip(reply.into()));
         let (exchange, counter) = w.resolve_counted(0x60, OP_REPORT_DATA, b"pong").await;
         w.expect_ack(exchange, counter).await;
         assert_eq!(reply_rx.try_recv().unwrap().unwrap(), b"pong");
@@ -24160,7 +24551,7 @@ mod tests {
             PendingReply::TimedAction {
                 action_opcode: 0x08,
                 action_payload: vec![0x15, 0x18],
-                reply,
+                reply: reply.into(),
             },
         );
         w.resolve_counted(
@@ -24192,7 +24583,7 @@ mod tests {
             PendingReply::TimedAction {
                 action_opcode: 0x08,
                 action_payload: vec![0x15, 0x18],
-                reply,
+                reply: reply.into(),
             },
         );
         let rejection = matter_interaction::build_status_response(0x01); // FAILURE
@@ -24256,7 +24647,7 @@ mod tests {
     }
 
     /// A plain (not yet timed) write, as `start_action` registers one.
-    fn plain_write(reply: oneshot::Sender<Result<Vec<u8>, Error>>) -> PendingReply {
+    fn plain_write(reply: ActionReply) -> PendingReply {
         PendingReply::Action {
             opcode: OP_WRITE_REQUEST,
             timed_payload: Box::new(|| vec![0x15, 0x18]),
@@ -24271,7 +24662,7 @@ mod tests {
     async fn a_plain_actions_response_is_acked_before_the_caller_is_answered() {
         let mut w = wired_actor();
         let (reply, mut reply_rx) = oneshot::channel();
-        w.seed(0x6c, OP_WRITE_REQUEST, plain_write(reply));
+        w.seed(0x6c, OP_WRITE_REQUEST, plain_write(reply.into()));
         let response = write_response_success();
         let (exchange, counter) = w.resolve_counted(0x6c, OP_WRITE_RESPONSE, &response).await;
         w.expect_ack(exchange, counter).await;
@@ -24285,7 +24676,7 @@ mod tests {
     async fn a_needs_timed_rejection_is_acked_before_the_timed_retry() {
         let mut w = wired_actor();
         let (reply, _reply_rx) = oneshot::channel();
-        w.seed(0x6d, OP_WRITE_REQUEST, plain_write(reply));
+        w.seed(0x6d, OP_WRITE_REQUEST, plain_write(reply.into()));
         let (exchange, counter) = w
             .resolve_counted(
                 0x6d,
@@ -24385,7 +24776,7 @@ mod tests {
                 reply: PendingReply::TimedAction {
                     action_opcode: 0x08, // InvokeRequest
                     action_payload: vec![0x15, 0x18],
-                    reply,
+                    reply: reply.into(),
                 },
             },
         );
@@ -24728,7 +25119,7 @@ mod tests {
         let counter = w.buffer_device_message(0x78);
         let (reply, _reply_rx) = oneshot::channel();
         // `retried`, so the timeout fails the op rather than reconnecting.
-        w.seed(0x78, 0x02, PendingReply::RoundTrip(reply));
+        w.seed(0x78, 0x02, PendingReply::RoundTrip(reply.into()));
         w.actor
             .on_pending_timeout(w.sid, 0x78, SubscribeFailure::MrpExpired)
             .await;

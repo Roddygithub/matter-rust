@@ -5,6 +5,13 @@ All notable changes to crates in the `matter-rust` workspace.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+- matter-controller: add `Node::invoke_before` with an absolute deadline that
+  follows queued actions, session establishment, timed fallback and MRP retries.
+  Abandoned callers stop further action sends; transmitted packets cannot be recalled.
+- matter-controller: roll back a newly created fabric when its durable save fails.
+
 ## About 0.1.0 — the first published release
 
 **Every crate here is published to crates.io at `0.1.0`, and that is the first
