@@ -6688,7 +6688,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         {
             Ok(counter) => counter,
             Err(e) => {
-                self.finish_exchange(sid, exchange, p.peer).await;
+                self.abort_exchange(sid, exchange, p.peer).await;
                 let _ = reply.send(Err(e));
                 return;
             }
@@ -23146,6 +23146,158 @@ mod tests {
         assert!(actor.state.fabrics.is_empty());
         actor.store = Arc::new(MemStore::default());
         assert!(actor.handle_create_fabric(&cfg()).await.is_ok());
+    }
+
+    /// Blocks (1) or fails (2) only the application send under test. Once
+    /// released, any orphaned MRP retransmit would reach the paired device.
+    struct GuardedSendTransport {
+        io: InMemoryDatagram,
+        mode: Arc<std::sync::atomic::AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    impl AsyncDatagram for GuardedSendTransport {
+        async fn send_to(&self, buf: &[u8], peer: SocketAddr) -> std::io::Result<()> {
+            match self.mode.load(std::sync::atomic::Ordering::SeqCst) {
+                1 => {
+                    self.entered.notify_one();
+                    std::future::pending::<()>().await;
+                }
+                2 => return Err(std::io::Error::other("synthetic send failure")),
+                _ => {}
+            }
+            self.io.send_to(buf, peer).await
+        }
+
+        async fn recv_from(&self) -> std::io::Result<(Vec<u8>, SocketAddr)> {
+            self.io.recv_from().await
+        }
+    }
+
+    #[allow(clippy::too_many_lines)] // Shared setup and expiry/drop/IO-error matrix for both send paths.
+    async fn guarded_send_leaves_no_retransmit(timed: bool) {
+        // Exercise expiry and caller drop while blocked, plus a transport error
+        // after encode. In each case Pending is absent when MRP runs.
+        for failure in 0..3 {
+            let w = wired_actor();
+            let peer = w.dev.local_addr();
+            let mode = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let mut actor = Actor::new(
+                GuardedSendTransport {
+                    io: w.actor.transport,
+                    mode: Arc::clone(&mode),
+                    entered: Arc::clone(&entered),
+                },
+                NullDiscovery,
+                Arc::new(MemStore::default()),
+                Arc::new(SystemNocRng),
+                ControllerState { fabrics: vec![] },
+                None,
+                crate::builder::DEFAULT_ADMIN_VENDOR_ID,
+            );
+            actor.sessions = w.actor.sessions;
+            actor.sessions.get_mut(w.sid).unwrap().peer_addr = Some(peer);
+            let (tx, rx) = oneshot::channel();
+            let mut reply = Some(ActionReply::before(
+                tx,
+                std::time::Instant::now() + Duration::from_millis(100),
+            ));
+            let exchange = if timed {
+                let (exchange, counter) = actor
+                    .send_request(
+                        w.sid,
+                        peer,
+                        OP_TIMED_REQUEST,
+                        ProtocolId::INTERACTION_MODEL,
+                        &[],
+                    )
+                    .await
+                    .unwrap();
+                w.dev.recv_from().await.unwrap();
+                actor.pending.insert(
+                    (w.sid, exchange),
+                    Pending {
+                        response_deadline: Instant::now() + Duration::from_secs(10),
+                        node_id: 0x42,
+                        peer,
+                        request: PendingRequest {
+                            opcode: OP_TIMED_REQUEST,
+                            protocol_id: ProtocolId::INTERACTION_MODEL,
+                            payload: vec![],
+                        },
+                        retried: false,
+                        last_reliable_send: Some(counter),
+                        reply: PendingReply::TimedAction {
+                            action_opcode: OP_INVOKE_REQUEST,
+                            action_payload: vec![],
+                            reply: reply.take().unwrap(),
+                        },
+                    },
+                );
+                Some(exchange)
+            } else {
+                None
+            };
+            mode.store(
+                if failure == 2 { 2 } else { 1 },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let send = async {
+                if let Some(exchange) = exchange {
+                    actor
+                        .resolve_timed(
+                            w.sid,
+                            exchange,
+                            matter_interaction::build_status_response(0),
+                        )
+                        .await;
+                } else {
+                    assert!(actor
+                        .send_request_guarded(
+                            w.sid,
+                            peer,
+                            OP_INVOKE_REQUEST,
+                            ProtocolId::INTERACTION_MODEL,
+                            &[],
+                            reply.as_mut(),
+                        )
+                        .await
+                        .is_err());
+                    drop(reply.take());
+                }
+            };
+            // First-request and timed sends both encode before awaiting IO.
+            let cancel = async {
+                if failure == 1 {
+                    entered.notified().await;
+                    drop(rx);
+                } else {
+                    let _ = rx.await;
+                }
+            };
+            tokio::join!(send, cancel);
+            mode.store(0, std::sync::atomic::Ordering::SeqCst);
+            assert!(actor.pending.is_empty());
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            actor.drive_mrp().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), w.dev.recv_from())
+                    .await
+                    .is_err(),
+                "abandoned payload retransmitted: timed={timed}, failure={failure}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_timed_send_errors_purge_retransmits() {
+        guarded_send_leaves_no_retransmit(true).await;
+    }
+
+    #[tokio::test]
+    async fn deadline_first_send_errors_purge_retransmits() {
+        guarded_send_leaves_no_retransmit(false).await;
     }
 
     #[tokio::test]
