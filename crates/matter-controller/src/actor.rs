@@ -6210,7 +6210,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             return;
         };
         if !response_needs_timed(opcode, &payload) {
-            self.finish_exchange(sid, exchange, p.peer).await;
+            self.abort_exchange(sid, exchange, p.peer).await;
             let _ = reply.send(Ok(payload));
             return;
         }
@@ -6223,7 +6223,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             self.timed_paths.insert(k);
         }
         // The plain attempt's exchange is over; the timed retry opens a new one.
-        self.finish_exchange(sid, exchange, p.peer).await;
+        self.abort_exchange(sid, exchange, p.peer).await;
         self.begin_timed(
             sid,
             p.peer,
@@ -6560,7 +6560,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         match kind {
             Kind::RoundTrip => {
                 if let Some(p) = self.pending.remove(&key) {
-                    self.finish_exchange(session_id, exchange_id, p.peer).await;
+                    self.abort_exchange(session_id, exchange_id, p.peer).await;
                     if let PendingReply::RoundTrip(reply) = p.reply {
                         let _ = reply.send(Ok(payload));
                     }
@@ -6672,7 +6672,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         if !success {
             // The device rejected the TimedRequest (e.g. TIMED_REQUEST_MISMATCH)
             // or sent an unexpected message — hand the bytes back to the caller.
-            self.finish_exchange(sid, exchange, p.peer).await;
+            self.abort_exchange(sid, exchange, p.peer).await;
             let _ = reply.send(Ok(payload));
             return;
         }
@@ -7545,6 +7545,11 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
     /// retransmits on it. For an exchange we are abandoning, which is always
     /// one we started (a pending op), so the device's exchange with the same
     /// id, if any, keeps its retransmits.
+    ///
+    /// Invariant: application bytes must not outlive their reply guard. Every
+    /// terminal removal of an Action/TimedAction/RoundTrip pending aborts,
+    /// including success and timed fallback; a retry transfers the guard to a
+    /// new exchange only after aborting the old one.
     async fn abort_exchange(&mut self, sid: SessionId, exchange: u16, peer: SocketAddr) {
         for event in self.sessions.abort_exchange_with_role(sid, exchange, true) {
             self.send_ack_event(event, Some(peer)).await;
@@ -7859,8 +7864,9 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
     /// Unlike [`Self::on_pending_timeout`], a fired deadline here does **not**
     /// reconnect and re-send. That path exists for MRP expiry, where the
     /// absence of an ACK means the request most likely never arrived, so
-    /// re-sending is safe. Here delivery was confirmed — the device may well
-    /// have executed a non-idempotent command already — so the op is failed
+    /// re-sending is safe. Here delivery may have been confirmed (a short
+    /// response deadline can also beat MRP expiry), so the device may have
+    /// executed a non-idempotent command already. The op is failed
     /// with [`Error::ResponseTimeout`] and whether to retry is the caller's
     /// decision.
     ///
@@ -7930,7 +7936,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
             let Some(p) = self.pending.remove(&key) else {
                 continue;
             };
-            self.finish_exchange(key.0, key.1, p.peer).await;
+            self.abort_exchange(key.0, key.1, p.peer).await;
             let node_id = p.node_id;
             let after = self.response_deadline;
             tracing::debug!(
@@ -7938,7 +7944,7 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
                 exchange_id = key.1,
                 after_secs = after.as_secs(),
                 "operational response deadline elapsed; failing the request \
-                 (delivery was ACKed, so it is not retried)"
+                 (non-idempotent requests are not retried)"
             );
             Self::fail_pending(p, Error::ResponseTimeout { node_id, after });
         }
@@ -7958,9 +7964,9 @@ impl<T: AsyncDatagram, D: Discovery> Actor<T, D> {
         let Some(p) = self.pending.remove(&(session_id, exchange_id)) else {
             return;
         };
-        // The exchange is over whatever happens next (a retry uses a new
-        // one); send anything it still owes.
-        self.finish_exchange(session_id, exchange_id, p.peer).await;
+        // A retry uses a new exchange. Abort the old one even if MRP has
+        // not expired yet (the response deadline can fire first).
+        self.abort_exchange(session_id, exchange_id, p.peer).await;
         // A resubscribe attempt (no oneshot reply) reschedules on the backoff
         // rather than failing — chip retries forever. An INITIAL subscribe
         // (reply `Some`) does not come here: it falls through to the
@@ -23298,6 +23304,82 @@ mod tests {
     #[tokio::test]
     async fn deadline_first_send_errors_purge_retransmits() {
         guarded_send_leaves_no_retransmit(false).await;
+    }
+
+    // Lose the initial datagram without decoding/ACKing it. The response
+    // timeout removes Pending before the absolute guard expires; MRP's first
+    // retry falls after both. A live session must not replay orphaned bytes.
+    #[tokio::test]
+    async fn response_timeout_purges_deadline_bound_retransmits() {
+        for kind in 0..3 {
+            let mut w = wired_actor();
+            let peer = w.dev.local_addr();
+            w.actor.sessions.get_mut(w.sid).unwrap().peer_addr = Some(peer);
+            let (exchange, counter) = w
+                .actor
+                .send_request(
+                    w.sid,
+                    peer,
+                    OP_INVOKE_REQUEST,
+                    ProtocolId::INTERACTION_MODEL,
+                    &[],
+                )
+                .await
+                .unwrap();
+            w.dev.recv_from().await.unwrap(); // lost on the network
+            let (tx, rx) = oneshot::channel();
+            let reply =
+                ActionReply::before(tx, std::time::Instant::now() + Duration::from_millis(100));
+            let reply = match kind {
+                0 => PendingReply::RoundTrip(reply),
+                1 => PendingReply::TimedAction {
+                    action_opcode: OP_INVOKE_REQUEST,
+                    action_payload: vec![],
+                    reply,
+                },
+                _ => PendingReply::Action {
+                    opcode: OP_INVOKE_REQUEST,
+                    timed_payload: Box::new(Vec::new),
+                    keys: vec![],
+                    timeout_ms: 100,
+                    node_id: 0x42,
+                    reply,
+                },
+            };
+            w.actor.response_deadline = Duration::from_millis(10);
+            w.actor.pending.insert(
+                (w.sid, exchange),
+                Pending {
+                    response_deadline: Instant::now() + w.actor.response_deadline,
+                    node_id: 0x42,
+                    peer,
+                    request: PendingRequest {
+                        opcode: OP_INVOKE_REQUEST,
+                        protocol_id: ProtocolId::INTERACTION_MODEL,
+                        payload: vec![],
+                    },
+                    retried: true,
+                    last_reliable_send: Some(counter),
+                    reply,
+                },
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            w.actor.drive_response_deadlines().await;
+            assert!(matches!(
+                rx.await.unwrap(),
+                Err(Error::ResponseTimeout { .. })
+            ));
+            assert!(w.actor.pending.is_empty());
+            assert!(w.actor.sessions.get(w.sid).is_some());
+            tokio::time::sleep(Duration::from_millis(600)).await;
+            w.actor.drive_mrp().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), w.dev.recv_from())
+                    .await
+                    .is_err(),
+                "orphaned action kind {kind} retransmitted"
+            );
+        }
     }
 
     #[tokio::test]
